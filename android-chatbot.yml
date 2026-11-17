@@ -5,11 +5,11 @@ on:
   push:
     paths:
       - "android_chatbot/**"
-      - ".github/workflows/android-chatbot.yml"
+      - ".github/workflows/main.yml"
   pull_request:
     paths:
       - "android_chatbot/**"
-      - ".github/workflows/android-chatbot.yml"
+      - ".github/workflows/main.yml"
 
 permissions:
   contents: read
@@ -28,11 +28,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android build packages
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "cmake;3.31.6" "ndk;27.2.12479018"
+      # Uses the Android SDK that is already installed on GitHub's runner.
+      # (android-actions/setup-android failed because the newer cmdline-tools
+      # no longer include the legacy "tools" package it tries to install.)
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER="$(command -v sdkmanager)"
+          echo "Using sdkmanager: $SDKMANAGER (ANDROID_HOME=$ANDROID_HOME)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0" "cmake;3.31.6" "ndk;27.2.12479018"
 
       # Non-blocking: checks that the C++ bridge only uses llama.cpp functions that
       # exist at the commit pinned in CMakeLists.txt, and reports any mismatch in the
