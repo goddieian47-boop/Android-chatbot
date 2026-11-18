@@ -9,36 +9,73 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      # Finds the folder that contains gradlew, so it works whether the project is
-      # at the repo root or inside a subfolder.
-      - name: Locate Android project
+      # Finds the project and checks that all key files are present.
+      # Preferred: a project zip in the repo root (android_chatbot_fixed.zip), which is
+      # unpacked here. This avoids files going missing during phone uploads.
+      # Fallback: loose project files in the repository.
+      - name: Prepare project sources
         shell: bash
         run: |
-          gradlew_path=$(find . -maxdepth 3 -name gradlew -type f | sort | head -n 1)
-          if [ -z "$gradlew_path" ]; then
-            echo "::error::No gradlew file found in the repository. Top-level contents:"
-            ls -la
+          work="$RUNNER_TEMP/project"
+          rm -rf "$work" && mkdir -p "$work"
+          zip_file=""
+          if [ -f android_chatbot_fixed.zip ]; then
+            zip_file=android_chatbot_fixed.zip
+          else
+            zip_file=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | sort | tail -n 1)
+          fi
+          if [ -n "$zip_file" ]; then
+            echo "Using project zip: $zip_file"
+            unzip -q "$zip_file" -d "$work"
+            src="$work"
+          else
+            echo "No project zip found; using the files in the repository."
+            src="."
+          fi
+
+          settings=$(find "$src" -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/.git/*' | sort | head -n 1)
+          if [ -z "$settings" ]; then
+            echo "::error::No settings.gradle(.kts) found, so the Android project is not in the repository."
+            {
+              echo "### Project not found"
+              echo "Upload \`android_chatbot_fixed.zip\` to the repository root (Add file > Upload files). The workflow unpacks it automatically."
+            } >> "$GITHUB_STEP_SUMMARY"
+            find . -maxdepth 3 -not -path './.git/*' | head -100
             exit 1
           fi
-          dir=$(dirname "$gradlew_path")
+          dir=$(cd "$(dirname "$settings")" && pwd)
           echo "Android project directory: $dir"
+
+          missing=""
+          for f in app/build.gradle.kts app/src/main/AndroidManifest.xml \
+                   app/src/main/cpp/CMakeLists.txt app/src/main/cpp/native_bridge.cpp; do
+            [ -f "$dir/$f" ] || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::The project is incomplete. Missing:$missing"
+            {
+              echo "### Project files missing"
+              echo "Missing:$missing"
+              echo "Upload \`android_chatbot_fixed.zip\` to the repository root (Add file > Upload files). The workflow unpacks it automatically."
+            } >> "$GITHUB_STEP_SUMMARY"
+            find "$dir" -maxdepth 4 -not -path '*/.git/*' | head -100
+            exit 1
+          fi
           echo "PROJECT_DIR=$dir" >> "$GITHUB_ENV"
 
       # Uses the Android SDK that is already installed on GitHub's runner.
-      # (android-actions/setup-android failed because the newer cmdline-tools
-      # no longer include the legacy "tools" package it tries to install.)
       - name: Install Android SDK packages
         shell: bash
         run: |
@@ -48,25 +85,23 @@ jobs:
           yes | "$SDKMANAGER" --licenses > /dev/null || true
           "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0" "cmake;3.31.6" "ndk;27.2.12479018"
 
-      # Non-blocking: checks that the C++ bridge only uses llama.cpp functions that
-      # exist at the commit pinned in CMakeLists.txt, and reports any mismatch in the
-      # run summary. A mismatch here is the most likely cause of a native build failure.
+      # Informational only: never fails the build. Checks that the C++ bridge only uses
+      # llama.cpp functions that exist at the commit pinned in CMakeLists.txt and reports
+      # any mismatch in the run summary.
       - name: Check native bridge against pinned llama.cpp
-        continue-on-error: true
         shell: bash
         run: |
           cmake_file="$PROJECT_DIR/app/src/main/cpp/CMakeLists.txt"
-          sha=$(grep -oE 'GIT_TAG[[:space:]]+[0-9a-f]{40}' "$cmake_file" | awk '{print $2}')
+          sha=$(grep -oE 'GIT_TAG[[:space:]]+[0-9a-f]{40}' "$cmake_file" | awk '{print $2}' || true)
+          note() { { echo "### Native preflight"; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; echo "::warning::$1"; }
+          if [ -z "$sha" ]; then note "No pinned llama.cpp commit found in CMakeLists.txt; skipping check."; exit 0; fi
           echo "Pinned llama.cpp commit: $sha"
           mkdir -p "$RUNNER_TEMP/llama" && cd "$RUNNER_TEMP/llama"
           git init -q
           git remote add origin https://github.com/ggml-org/llama.cpp.git
           if ! git fetch -q --depth 1 origin "$sha"; then
-            msg="Could not fetch pinned llama.cpp commit $sha. Check GIT_TAG in CMakeLists.txt."
-            echo "::error::$msg"
-            echo "### Native preflight" >> "$GITHUB_STEP_SUMMARY"
-            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+            note "Could not fetch pinned llama.cpp commit $sha. Check GIT_TAG in CMakeLists.txt."
+            exit 0
           fi
           git checkout -q FETCH_HEAD
           missing=""
@@ -81,32 +116,23 @@ jobs:
           for opt in LLAMA_BUILD_MTMD MTMD_VIDEO LLAMA_BUILD_APP; do
             grep -rqw "$opt" CMakeLists.txt tools cmake 2>/dev/null || missing="$missing (cmake option $opt)"
           done
-          {
-            echo "### Native preflight"
-            echo "Pinned llama.cpp: \`$sha\`"
-            if [ -n "$missing" ]; then
-              echo "Not found at that commit:$missing"
-              echo "native_bridge.cpp / CMakeLists.txt are probably out of sync with this llama.cpp revision."
-            else
-              echo "All llama.cpp / mtmd symbols used by native_bridge.cpp were found."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$missing" ]; then
-            echo "::warning::Not found at pinned llama.cpp commit:$missing"
-            exit 1
+            note "Pinned llama.cpp \`$sha\` is missing:$missing . native_bridge.cpp / CMakeLists.txt are probably out of sync with it."
+          else
+            { echo "### Native preflight"; echo "Pinned llama.cpp \`$sha\`: all symbols used by native_bridge.cpp were found."; } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Installs Gradle 8.9 directly, so the build does not depend on gradle-wrapper.jar
+      # being present in the repository.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-
-      - name: Make Gradle wrapper executable
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: chmod +x ./gradlew
+        with:
+          gradle-version: "8.9"
 
       - name: Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
-        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee "$RUNNER_TEMP/build.log"
+        run: gradle --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: Show build errors in run summary
         if: failure()
