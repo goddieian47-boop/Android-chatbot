@@ -3,13 +3,6 @@ name: Android chatbot
 on:
   workflow_dispatch:
   push:
-    paths:
-      - "android_chatbot/**"
-      - ".github/workflows/main.yml"
-  pull_request:
-    paths:
-      - "android_chatbot/**"
-      - ".github/workflows/main.yml"
 
 permissions:
   contents: read
@@ -27,6 +20,21 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      # Finds the folder that contains gradlew, so it works whether the project is
+      # at the repo root or inside a subfolder.
+      - name: Locate Android project
+        shell: bash
+        run: |
+          gradlew_path=$(find . -maxdepth 3 -name gradlew -type f | sort | head -n 1)
+          if [ -z "$gradlew_path" ]; then
+            echo "::error::No gradlew file found in the repository. Top-level contents:"
+            ls -la
+            exit 1
+          fi
+          dir=$(dirname "$gradlew_path")
+          echo "Android project directory: $dir"
+          echo "PROJECT_DIR=$dir" >> "$GITHUB_ENV"
 
       # Uses the Android SDK that is already installed on GitHub's runner.
       # (android-actions/setup-android failed because the newer cmdline-tools
@@ -47,7 +55,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          cmake_file=android_chatbot/app/src/main/cpp/CMakeLists.txt
+          cmake_file="$PROJECT_DIR/app/src/main/cpp/CMakeLists.txt"
           sha=$(grep -oE 'GIT_TAG[[:space:]]+[0-9a-f]{40}' "$cmake_file" | awk '{print $2}')
           echo "Pinned llama.cpp commit: $sha"
           mkdir -p "$RUNNER_TEMP/llama" && cd "$RUNNER_TEMP/llama"
@@ -92,11 +100,11 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Make Gradle wrapper executable
-        working-directory: android_chatbot
+        working-directory: ${{ env.PROJECT_DIR }}
         run: chmod +x ./gradlew
 
       - name: Build debug APK
-        working-directory: android_chatbot
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: ./gradlew --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee "$RUNNER_TEMP/build.log"
 
@@ -123,5 +131,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: local-chat-debug-apk
-          path: android_chatbot/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
